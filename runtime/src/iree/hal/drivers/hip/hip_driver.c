@@ -481,7 +481,7 @@ static iree_status_t iree_hal_hip_driver_get_device_id_by_index(
   IREE_HIP_RETURN_IF_ERROR(&driver->hip_symbols,
                            hipGetDeviceCount(&device_count),
                            "hipGetDeviceCount");
-  if (device_index >= device_count) {
+  if (device_index < 0 || device_index >= device_count) {
     return iree_make_status(IREE_STATUS_NOT_FOUND,
                             "device %d not found (of %d enumerated)",
                             device_index, device_count);
