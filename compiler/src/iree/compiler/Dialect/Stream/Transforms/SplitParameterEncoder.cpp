@@ -1698,18 +1698,15 @@ addTargetEncoderFunc(Location loc, const TargetPlan &targetPlan,
   for (const auto &step : targetPlan.steps) {
     Location stepLoc = step.getLoc();
 
-    // Build a map of scope name to the outputs going to it and their parameter
-    // references. Note that this mapping is target-specific (as each target may
-    // have a different mix of parameters and parameter sizes due to differences
-    // in encodings).
+    // Build a flat list of all output reservations for this step.
+    // Each reservation pairs an expression output with its parameter subrange.
     struct OutputReservation {
       const EncodingExpr::Output *output = nullptr;
       const ParameterSubrange *parameterSubrange = nullptr;
       IREE::Stream::NamedParameterAttr parameterAttr;
-      size_t slabOffsetOrdinal = 0;
+      size_t slabOffsetOrdinal = 0; // index into ResourcePackOp results
     };
-    llvm::MapVector<StringAttr, SmallVector<OutputReservation>> scopeOutputs;
-    SmallVector<Value> outputSizes;
+    SmallVector<OutputReservation> allReservations;
     for (const EncodingExpr::Output &output : step.expr->outputs) {
       auto it = step.outputMap.find(&output);
       if (it == step.outputMap.end()) {
@@ -1720,37 +1717,82 @@ addTargetEncoderFunc(Location loc, const TargetPlan &targetPlan,
       reservation.output = &output;
       reservation.parameterSubrange = &subrange;
       reservation.parameterAttr = targetPlan.getNamedParameterAttr(subrange);
-      reservation.slabOffsetOrdinal = outputSizes.size();
-      scopeOutputs[reservation.parameterAttr.getScope()].push_back(reservation);
-      outputSizes.push_back(indexSet.get(subrange.length));
+      allReservations.push_back(reservation);
     }
 
-    // Allocate transient storage for all the parameter outputs.
-    // If we were overlapping we'd want to get this from a ringbuffer.
-    // TODO(benvanik): stream.async.ringbuffer-style ops for safely doing bump
-    // pointer allocation with timeline-awareness at this level.
-    auto reservationPackOp = IREE::Stream::ResourcePackOp::create(
-        funcBuilder, stepLoc, /*offset=*/nullptr, outputSizes,
-        targetPlan.affinityAttr);
-    Value outputSlabSize = reservationPackOp.getTotalLength();
-    auto outputSlabAllocaOp = IREE::Stream::ResourceAllocaOp::create(
-        funcBuilder, stepLoc, resourceType, timepointType, outputSlabSize,
-        /*indeterminate_lifetime=*/nullptr, lastTimepoint,
-        targetPlan.affinityAttr);
-    Value outputSlab = outputSlabAllocaOp.getResult();
+    // Split reservations into batches that each fit within the slab budget
+    // derived from the resource config's max allocation size.
+    int64_t maxSlabSize =
+        step.expr->getResourceConfigAttr().getMaxAllocationSize();
+    SmallVector<SmallVector<OutputReservation *>> batches;
+    batches.emplace_back();
+    int64_t batchTotal = 0;
+    for (auto &reservation : allReservations) {
+      int64_t size = reservation.parameterSubrange->length;
+      if (!batches.back().empty() && batchTotal + size > maxSlabSize) {
+        batches.emplace_back();
+        batchTotal = 0;
+      }
+      batches.back().push_back(&reservation);
+      batchTotal += size;
+    }
+    LLVM_DEBUG(DBGS() << "step has " << allReservations.size()
+                      << " outputs split into " << batches.size()
+                      << " slab batches\n");
 
-    // Note: Input parameters are NOT included in this slab allocation.
-    // Inputs are loaded via stream.async.constant operations (cloned below)
-    // which reference external parameter storage and don't require allocation.
-    // Only outputs need slab allocation as transient working memory before
-    // being scattered to their final parameter locations.
-    //
-    // Wait for the slab to be ready before we transition back into async IR.
-    outputSlab = IREE::Stream::TimepointAwaitOp::create(
-                     funcBuilder, stepLoc, {outputSlab}, {outputSlabSize},
-                     outputSlabAllocaOp.getResultTimepoint())
-                     .getResult(0);
+    // Phase 1:
+    // For each batch, build the scope-to-reservation map, compute output
+    // sizes, and allocate the transient slab. This is done before expression
+    // cloning to preserve the original IR ordering (slab allocation appears
+    // before expression ops in the output).
+    struct BatchState {
+      llvm::MapVector<StringAttr, SmallVector<OutputReservation *>>
+          scopeOutputs;
+      IREE::Stream::ResourcePackOp reservationPackOp;
+      Value outputSlabSize;
+      Value outputSlab;
+    };
+    SmallVector<BatchState> batchStates(batches.size());
+    for (auto [batch, state] : llvm::zip_equal(batches, batchStates)) {
+      SmallVector<Value> outputSizes;
+      for (auto *reservation : batch) {
+        reservation->slabOffsetOrdinal = outputSizes.size();
+        state.scopeOutputs[reservation->parameterAttr.getScope()].push_back(
+            reservation);
+        outputSizes.push_back(
+            indexSet.get(reservation->parameterSubrange->length));
+      }
 
+      // Allocate transient storage for this batch's parameter outputs.
+      // If we were overlapping we'd want to get this from a ringbuffer.
+      // TODO(benvanik): stream.async.ringbuffer-style ops for safely doing bump
+      // pointer allocation with timeline-awareness at this level.
+      state.reservationPackOp = IREE::Stream::ResourcePackOp::create(
+          funcBuilder, stepLoc, /*offset=*/nullptr, outputSizes,
+          targetPlan.affinityAttr);
+      state.outputSlabSize = state.reservationPackOp.getTotalLength();
+      auto outputSlabAllocaOp = IREE::Stream::ResourceAllocaOp::create(
+          funcBuilder, stepLoc, resourceType, timepointType,
+          state.outputSlabSize,
+          /*indeterminate_lifetime=*/nullptr, lastTimepoint,
+          targetPlan.affinityAttr);
+      state.outputSlab = outputSlabAllocaOp.getResult();
+
+      // Note: Input parameters are NOT included in this slab allocation.
+      // Inputs are loaded via stream.async.constant operations (cloned below)
+      // which reference external parameter storage and don't require
+      // allocation. Only outputs need slab allocation as transient working
+      // memory before being scattered to their final parameter locations.
+      //
+      // Wait for the slab to be ready before we transition back into async IR.
+      state.outputSlab =
+          IREE::Stream::TimepointAwaitOp::create(
+              funcBuilder, stepLoc, {state.outputSlab}, {state.outputSlabSize},
+              outputSlabAllocaOp.getResultTimepoint())
+              .getResult(0);
+    }
+
+    // Phase 2:
     // Clone the expression IR and fix it up for use in the new module.
     // We have to remove any affinities referencing the devices in the source
     // program and ensure we also bring along any referenced objects
@@ -1822,82 +1864,96 @@ addTargetEncoderFunc(Location loc, const TargetPlan &targetPlan,
       }
     }
 
-    // Scatter the outputs into the parameter(s) for each scope.
-    for (const auto &[scope, outputReservations] : scopeOutputs) {
-      for (auto &reservation : outputReservations) {
-        Location outputLoc = reservation.output->getLoc();
-        Value outputValue =
-            exprMapping.lookup(reservation.output->producedValue);
-        Value packedOffset =
-            reservationPackOp.getPackedOffsets()[reservation.slabOffsetOrdinal];
-        Value packedEnd =
-            indexSet.add(packedOffset, reservation.parameterSubrange->length);
-        Value outputSize = indexSet.get(reservation.parameterSubrange->length);
-        auto updateOp = IREE::Stream::AsyncUpdateOp::create(
-            funcBuilder, outputLoc, outputSlab.getType(), outputSlab,
-            outputSlabSize, packedOffset, packedEnd, outputValue, outputSize,
-            targetPlan.affinityAttr);
-        outputSlab = updateOp.getResult();
-      }
-    }
-    auto outputBarrierOp = IREE::Stream::TimepointBarrierOp::create(
-        funcBuilder, step.getLoc(), outputSlab, outputSlabSize,
-        targetPlan.affinityAttr);
-    outputSlab = outputBarrierOp.getResult();
+    // Phase 3:
+    // For each batch, update outputs into the slab, barrier, scatter to
+    // parameter storage, and deallocate. Expression ops were cloned in
+    // phase 2 and the output values are available via exprMapping.
+    for (auto &state : batchStates) {
+      Value outputSlab = state.outputSlab;
+      Value outputSlabSize = state.outputSlabSize;
 
-    // Scatter parameters from the transient slab into each target scope.
-    SmallVector<Value> scatterTimepoints;
-    for (const auto &[scope, outputReservations] : scopeOutputs) {
-      SmallVector<Location> outputLocs;
-      SmallVector<Value> sourceOffsets;
-      SmallVector<Value> sourceEnds;
-      SmallVector<Value> sourceLengths;
-      SmallVector<Value> targetKeyValues;
-      SmallVector<Value> targetOffsets;
-      for (auto &reservation : outputReservations) {
-        outputLocs.push_back(reservation.output->getLoc());
-        Value packedOffset =
-            reservationPackOp.getPackedOffsets()[reservation.slabOffsetOrdinal];
-        Value packedSize = indexSet.get(reservation.parameterSubrange->length);
-        sourceOffsets.push_back(packedOffset);
-        sourceLengths.push_back(packedSize);
-        targetKeyValues.push_back(IREE::Util::BufferConstantOp::create(
-            funcBuilder, reservation.output->getLoc(),
-            reservation.parameterAttr.getKey().getValue()));
-        targetOffsets.push_back(
-            i64Set.get(reservation.parameterSubrange->offset));
+      // Update the slab with each output value from the cloned expression.
+      for (const auto &[scope, outputReservations] : state.scopeOutputs) {
+        for (auto *reservation : outputReservations) {
+          Location outputLoc = reservation->output->getLoc();
+          Value outputValue =
+              exprMapping.lookup(reservation->output->producedValue);
+          Value packedOffset =
+              state.reservationPackOp
+                  .getPackedOffsets()[reservation->slabOffsetOrdinal];
+          Value packedEnd = indexSet.add(
+              packedOffset, reservation->parameterSubrange->length);
+          Value outputSize =
+              indexSet.get(reservation->parameterSubrange->length);
+          auto updateOp = IREE::Stream::AsyncUpdateOp::create(
+              funcBuilder, outputLoc, outputSlab.getType(), outputSlab,
+              outputSlabSize, packedOffset, packedEnd, outputValue, outputSize,
+              targetPlan.affinityAttr);
+          outputSlab = updateOp.getResult();
+        }
       }
-      // Compute source ends (offset + length) for async parameter scatter.
-      for (auto [offset, length] :
-           llvm::zip_equal(sourceOffsets, sourceLengths)) {
-        auto end = funcBuilder.createOrFold<mlir::arith::AddIOp>(
-            funcBuilder.getFusedLoc(outputLocs), offset, length);
-        sourceEnds.push_back(end);
-      }
-      // Materialize scope as util.buffer.constant (null Value for no scope).
-      Value scopeValue;
-      if (scope) {
-        scopeValue = IREE::Util::BufferConstantOp::create(
-            funcBuilder, funcBuilder.getFusedLoc(outputLocs), scope.getValue());
-      }
-      auto scatterOp = IREE::Stream::AsyncParameterScatterOp::create(
-          funcBuilder, funcBuilder.getFusedLoc(outputLocs), outputSlab,
-          outputSlabSize, sourceOffsets, sourceEnds, sourceLengths, scopeValue,
-          targetKeyValues, targetOffsets, outputBarrierOp.getResultTimepoint(),
+      auto outputBarrierOp = IREE::Stream::TimepointBarrierOp::create(
+          funcBuilder, step.getLoc(), outputSlab, outputSlabSize,
           targetPlan.affinityAttr);
-      // AsyncParameterScatterOp returns (resource, timepoint) tuple.
-      outputSlab = scatterOp.getResult();
-      scatterTimepoints.push_back(scatterOp.getResultTimepoint());
+      outputSlab = outputBarrierOp.getResult();
+
+      // Scatter parameters from the transient slab into each target scope.
+      SmallVector<Value> scatterTimepoints;
+      for (const auto &[scope, outputReservations] : state.scopeOutputs) {
+        SmallVector<Location> outputLocs;
+        SmallVector<Value> sourceOffsets;
+        SmallVector<Value> sourceEnds;
+        SmallVector<Value> sourceLengths;
+        SmallVector<Value> targetKeyValues;
+        SmallVector<Value> targetOffsets;
+        for (auto *reservation : outputReservations) {
+          outputLocs.push_back(reservation->output->getLoc());
+          Value packedOffset =
+              state.reservationPackOp
+                  .getPackedOffsets()[reservation->slabOffsetOrdinal];
+          Value packedSize =
+              indexSet.get(reservation->parameterSubrange->length);
+          sourceOffsets.push_back(packedOffset);
+          sourceLengths.push_back(packedSize);
+          targetKeyValues.push_back(IREE::Util::BufferConstantOp::create(
+              funcBuilder, reservation->output->getLoc(),
+              reservation->parameterAttr.getKey().getValue()));
+          targetOffsets.push_back(
+              i64Set.get(reservation->parameterSubrange->offset));
+        }
+        // Compute source ends (offset + length) for async parameter scatter.
+        for (auto [offset, length] :
+             llvm::zip_equal(sourceOffsets, sourceLengths)) {
+          auto end = funcBuilder.createOrFold<mlir::arith::AddIOp>(
+              funcBuilder.getFusedLoc(outputLocs), offset, length);
+          sourceEnds.push_back(end);
+        }
+        // Materialize scope as util.buffer.constant (null Value for no scope).
+        Value scopeValue;
+        if (scope) {
+          scopeValue = IREE::Util::BufferConstantOp::create(
+              funcBuilder, funcBuilder.getFusedLoc(outputLocs),
+              scope.getValue());
+        }
+        auto scatterOp = IREE::Stream::AsyncParameterScatterOp::create(
+            funcBuilder, funcBuilder.getFusedLoc(outputLocs), outputSlab,
+            outputSlabSize, sourceOffsets, sourceEnds, sourceLengths,
+            scopeValue, targetKeyValues, targetOffsets,
+            outputBarrierOp.getResultTimepoint(), targetPlan.affinityAttr);
+        // AsyncParameterScatterOp returns (resource, timepoint) tuple.
+        outputSlab = scatterOp.getResult();
+        scatterTimepoints.push_back(scatterOp.getResultTimepoint());
+      }
+      Value scattersTimepoint = IREE::Stream::TimepointJoinOp::create(
+          funcBuilder, stepLoc, scatterTimepoints);
+
+      // Deallocate the output slab (now the scattered resource).
+      Value deallocaTimepoint = IREE::Stream::ResourceDeallocaOp::create(
+          funcBuilder, stepLoc, outputSlab, outputSlabSize,
+          /*prefer_origin=*/false, scattersTimepoint, targetPlan.affinityAttr);
+
+      lastTimepoint = deallocaTimepoint;
     }
-    Value scattersTimepoint = IREE::Stream::TimepointJoinOp::create(
-        funcBuilder, stepLoc, scatterTimepoints);
-
-    // Deallocate the output slab (now the scattered resource).
-    Value deallocaTimepoint = IREE::Stream::ResourceDeallocaOp::create(
-        funcBuilder, stepLoc, outputSlab, outputSlabSize,
-        /*prefer_origin=*/false, scattersTimepoint, targetPlan.affinityAttr);
-
-    lastTimepoint = deallocaTimepoint;
   }
 
   // Chain the final timepoint (which depends on all steps via the loop above)
