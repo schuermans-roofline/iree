@@ -1348,6 +1348,9 @@ static SmallVector<ConstantAllocation> extractConstantsWithLifetime(
     IREE::Stream::AsyncExecuteOp executeOp, IREE::Stream::Lifetime lifetime,
     AffinityAnalysis &affinityAnalysis, OpBuilder &externalBuilder) {
   SmallVector<ConstantAllocation> constantAllocations;
+  int64_t maxAllocationSize =
+      IREE::Stream::ResourceConfigAttr::lookup(executeOp)
+          .getMaxAllocationSize();
 
   [[maybe_unused]] std::unique_ptr<AsmState> asmState;
   LLVM_DEBUG(asmState = std::make_unique<AsmState>(executeOp->getParentOp()));
@@ -1355,9 +1358,30 @@ static SmallVector<ConstantAllocation> extractConstantsWithLifetime(
   // Bucket constant ops by affinity and whether they are global (from our
   // perspective, in that they escape into the global program) or local (only
   // used within this region and guaranteed dead by the end).
+  // Due to size limitations, a single affinity might have to use multiple
+  // buckets.
+  struct ConstantsBucket {
+    SmallVector<IREE::Stream::AsyncConstantOp> ops;
+    int64_t totalSize = 0;
+  };
+  struct ConstantsBucketList {
+    SmallVector<ConstantsBucket> buckets;
+
+    void addOp(IREE::Stream::AsyncConstantOp &op, int64_t maxSize) {
+      APInt opSizeInt;
+      int64_t opSize = 0;
+      if (matchPattern(op.getResultSize(), m_ConstantInt(&opSizeInt))) {
+        opSize = opSizeInt.getZExtValue();
+      }
+      if (buckets.empty() || buckets.back().totalSize + opSize > maxSize) {
+        buckets.push_back(ConstantsBucket());
+      }
+      buckets.back().ops.push_back(op);
+      buckets.back().totalSize += opSize;
+    }
+  };
   using ConstantsForAffinityMap =
-      llvm::MapVector<IREE::Stream::AffinityAttr,
-                      SmallVector<IREE::Stream::AsyncConstantOp>>;
+      llvm::MapVector<IREE::Stream::AffinityAttr, ConstantsBucketList>;
   ConstantsForAffinityMap globalConstantOps;
   ConstantsForAffinityMap localConstantOps;
   for (auto constantOp : executeOp.getOps<IREE::Stream::AsyncConstantOp>()) {
@@ -1414,9 +1438,10 @@ static SmallVector<ConstantAllocation> extractConstantsWithLifetime(
 
     // Append to affinity bucket.
     if (resultValue) {
-      globalConstantOps[allocationAffinity].push_back(constantOp);
+      globalConstantOps[allocationAffinity].addOp(constantOp,
+                                                  maxAllocationSize);
     } else {
-      localConstantOps[allocationAffinity].push_back(constantOp);
+      localConstantOps[allocationAffinity].addOp(constantOp, maxAllocationSize);
     }
   }
 
@@ -1426,13 +1451,17 @@ static SmallVector<ConstantAllocation> extractConstantsWithLifetime(
   // we run all initializers to completion and are (as much as we can be) pretty
   // sure the non-transient allocation gets released by the time we get back to
   // user code.
-  for (auto [affinityAttr, constantOps] : globalConstantOps) {
-    constantAllocations.push_back(allocateConstantBatch(
-        executeOp, affinityAttr, constantOps, externalBuilder));
+  for (auto [affinityAttr, constantsBucketList] : globalConstantOps) {
+    for (auto &constantsBucket : constantsBucketList.buckets) {
+      constantAllocations.push_back(allocateConstantBatch(
+          executeOp, affinityAttr, constantsBucket.ops, externalBuilder));
+    }
   }
-  for (auto [affinityAttr, constantOps] : localConstantOps) {
-    constantAllocations.push_back(allocateConstantBatch(
-        executeOp, affinityAttr, constantOps, externalBuilder));
+  for (auto [affinityAttr, constantsBucketList] : localConstantOps) {
+    for (auto &constantsBucket : constantsBucketList.buckets) {
+      constantAllocations.push_back(allocateConstantBatch(
+          executeOp, affinityAttr, constantsBucket.ops, externalBuilder));
+    }
   }
 
   return constantAllocations;
@@ -1493,8 +1522,28 @@ struct ResultAllocation {
 };
 
 // A map of allocation placement affinities to the alloc reservations requested.
+struct ResultReservationsBucket {
+  SmallVector<ResultReservation> reservations;
+  int64_t totalSize = 0;
+};
+struct ResultReservationsBucketList {
+  SmallVector<ResultReservationsBucket> buckets;
+
+  void addReservation(ResultReservation &reservation, int64_t maxSize) {
+    APInt opSizeInt;
+    int64_t opSize = 0;
+    if (matchPattern(reservation.resultSize, m_ConstantInt(&opSizeInt))) {
+      opSize = opSizeInt.getZExtValue();
+    }
+    if (buckets.empty() || buckets.back().totalSize + opSize > maxSize) {
+      buckets.push_back(ResultReservationsBucket());
+    }
+    buckets.back().reservations.push_back(reservation);
+    buckets.back().totalSize += opSize;
+  }
+};
 using ResultAllocationMap =
-    llvm::MapVector<IREE::Stream::AffinityAttr, SmallVector<ResultReservation>>;
+    llvm::MapVector<IREE::Stream::AffinityAttr, ResultReservationsBucketList>;
 
 // Produces parameters for one or more result allocations composed of an ordered
 // set of |reservations| with matching lifetimes. Allocations will be bucketed
@@ -1504,18 +1553,29 @@ static std::vector<ResultAllocation>
 reserveResultAllocations(ResultAllocationMap &reservationMap) {
   std::vector<ResultAllocation> result;
   for (auto &[affinityAttr, reservations] : reservationMap) {
+    // Each bucket already respects the max size budget, so produce one
+    // ResultReservationSet per bucket per lifetime to preserve the splitting.
     // We want deterministic ordering of the allocations for each lifetime type
     // so we build them all here and then just nuke the ones we don't end up
     // using.
-    SmallVector<ResultReservationSet> sets(
-        IREE::Stream::getMaxEnumValForLifetime() + 1);
-    for (auto &reservation : reservations) {
-      auto &set =
-          sets[static_cast<unsigned>(reservation.resultType.getLifetime())];
-      set.reservationLocs.push_back(reservation.loc);
-      set.reservationTypes.push_back(reservation.resultType);
-      set.reservationSizes.push_back(reservation.resultSize);
-      set.reservations.push_back(std::move(reservation));
+    SmallVector<ResultReservationSet> sets;
+    for (auto &bucket : reservations.buckets) {
+      // Sub-bucket by lifetime within each size-limited bucket.
+      llvm::DenseMap<unsigned, size_t> lifetimeToSetIndex;
+      for (auto &reservation : bucket.reservations) {
+        unsigned lifetime =
+            static_cast<unsigned>(reservation.resultType.getLifetime());
+        auto it = lifetimeToSetIndex.find(lifetime);
+        if (it == lifetimeToSetIndex.end()) {
+          lifetimeToSetIndex[lifetime] = sets.size();
+          sets.push_back(ResultReservationSet());
+        }
+        auto &set = sets[lifetimeToSetIndex[lifetime]];
+        set.reservationLocs.push_back(reservation.loc);
+        set.reservationTypes.push_back(reservation.resultType);
+        set.reservationSizes.push_back(reservation.resultSize);
+        set.reservations.push_back(std::move(reservation));
+      }
     }
 
     // Remove unused sets. This does a bunch of moves and is really bad but eh.
@@ -1640,6 +1700,9 @@ static bool isExecutedOnce(Operation *op) {
 static LogicalResult
 allocateExecutionRegion(IREE::Stream::AsyncExecuteOp executeOp,
                         AffinityAnalysis &affinityAnalysis) {
+  int64_t maxAllocationSize =
+      IREE::Stream::ResourceConfigAttr::lookup(executeOp)
+          .getMaxAllocationSize();
   LLVM_DEBUG(llvm::dbgs() << "[[ Allocating execution region ]]\n");
 
   AllocationScope scope(executeOp);
@@ -1868,7 +1931,8 @@ allocateExecutionRegion(IREE::Stream::AsyncExecuteOp executeOp,
       resultReservation.result.printAsOperand(llvm::dbgs(), asmState);
       llvm::dbgs() << "\n";
     });
-    resultReservations[allocationAffinity].push_back(resultReservation);
+    resultReservations[allocationAffinity].addReservation(resultReservation,
+                                                          maxAllocationSize);
   }
   for (auto &resultAllocation : reserveResultAllocations(resultReservations)) {
     for (auto &reservationSet : resultAllocation.reservationSets) {
