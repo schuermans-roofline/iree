@@ -1280,6 +1280,38 @@ struct ConstantAllocation {
   SmallVector<ConstantReservation> reservations;
 };
 
+// A bucket for collecting objects (e.g. AsyncConstantOps, TODO)
+// while tracking the total (static) size of the objects in the bucket.
+template <typename ObjT>
+struct SizeTrackingBucket {
+  SmallVector<ObjT> objs;
+  int64_t totalSize = 0;
+};
+
+Value getSizeInBucket(IREE::Stream::AsyncConstantOp &obj);
+
+Value getSizeInBucket(class ResourceReservation &obj);
+
+// List of size limited buckets (see SizeLimitedBucket above). Automatically
+// create a new bucket when the size of the previous one hits the limit.
+template <typename ObjT>
+struct SizeLimitedBucketList {
+  SmallVector<SizeTrackingBucket<ObjT>> buckets;
+
+  void add(ObjT &obj, int64_t maxSize) {
+    APInt opSizeInt;
+    int64_t opSize = 0;
+    if (matchPattern(getSizeInBucket(obj), m_ConstantInt(&opSizeInt))) {
+      opSize = opSizeInt.getZExtValue();
+    }
+    if (buckets.empty() || buckets.back().totalSize + opSize > maxSize) {
+      buckets.push_back(SizeTrackingBucket<ObjT>());
+    }
+    buckets.back().objs.push_back(obj);
+    buckets.back().totalSize += opSize;
+  }
+};
+
 // Returns true if |value| has one use and it is a stream.yield op.
 static bool isOnlyUseYield(Value value) {
   for (auto *user : value.getUsers()) {
@@ -1340,6 +1372,10 @@ allocateConstantBatch(IREE::Stream::AsyncExecuteOp executeOp,
   return allocation;
 }
 
+Value getSizeInBucket(IREE::Stream::AsyncConstantOp &obj) {
+  return obj.getResultSize();
+}
+
 // Extracts stream.async.constant ops with the given lifetime from |executeOp|
 // into their own dedicated stream.resource.constants upload op. The uploaded
 // constants will be captured by the region for use within as if they had still
@@ -1360,26 +1396,8 @@ static SmallVector<ConstantAllocation> extractConstantsWithLifetime(
   // used within this region and guaranteed dead by the end).
   // Due to size limitations, a single affinity might have to use multiple
   // buckets.
-  struct ConstantsBucket {
-    SmallVector<IREE::Stream::AsyncConstantOp> ops;
-    int64_t totalSize = 0;
-  };
-  struct ConstantsBucketList {
-    SmallVector<ConstantsBucket> buckets;
-
-    void addOp(IREE::Stream::AsyncConstantOp &op, int64_t maxSize) {
-      APInt opSizeInt;
-      int64_t opSize = 0;
-      if (matchPattern(op.getResultSize(), m_ConstantInt(&opSizeInt))) {
-        opSize = opSizeInt.getZExtValue();
-      }
-      if (buckets.empty() || buckets.back().totalSize + opSize > maxSize) {
-        buckets.push_back(ConstantsBucket());
-      }
-      buckets.back().ops.push_back(op);
-      buckets.back().totalSize += opSize;
-    }
-  };
+  using ConstantsBucketList =
+      SizeLimitedBucketList<IREE::Stream::AsyncConstantOp>;
   using ConstantsForAffinityMap =
       llvm::MapVector<IREE::Stream::AffinityAttr, ConstantsBucketList>;
   ConstantsForAffinityMap globalConstantOps;
@@ -1438,10 +1456,9 @@ static SmallVector<ConstantAllocation> extractConstantsWithLifetime(
 
     // Append to affinity bucket.
     if (resultValue) {
-      globalConstantOps[allocationAffinity].addOp(constantOp,
-                                                  maxAllocationSize);
+      globalConstantOps[allocationAffinity].add(constantOp, maxAllocationSize);
     } else {
-      localConstantOps[allocationAffinity].addOp(constantOp, maxAllocationSize);
+      localConstantOps[allocationAffinity].add(constantOp, maxAllocationSize);
     }
   }
 
@@ -1454,13 +1471,13 @@ static SmallVector<ConstantAllocation> extractConstantsWithLifetime(
   for (auto [affinityAttr, constantsBucketList] : globalConstantOps) {
     for (auto &constantsBucket : constantsBucketList.buckets) {
       constantAllocations.push_back(allocateConstantBatch(
-          executeOp, affinityAttr, constantsBucket.ops, externalBuilder));
+          executeOp, affinityAttr, constantsBucket.objs, externalBuilder));
     }
   }
   for (auto [affinityAttr, constantsBucketList] : localConstantOps) {
     for (auto &constantsBucket : constantsBucketList.buckets) {
       constantAllocations.push_back(allocateConstantBatch(
-          executeOp, affinityAttr, constantsBucket.ops, externalBuilder));
+          executeOp, affinityAttr, constantsBucket.objs, externalBuilder));
     }
   }
 
@@ -1521,27 +1538,10 @@ struct ResultAllocation {
   SmallVector<ResultReservationSet> reservationSets;
 };
 
-// A map of allocation placement affinities to the alloc reservations requested.
-struct ResultReservationsBucket {
-  SmallVector<ResultReservation> reservations;
-  int64_t totalSize = 0;
-};
-struct ResultReservationsBucketList {
-  SmallVector<ResultReservationsBucket> buckets;
+Value getSizeInBucket(ResultReservation &obj) { return obj.resultSize; }
 
-  void addReservation(ResultReservation &reservation, int64_t maxSize) {
-    APInt opSizeInt;
-    int64_t opSize = 0;
-    if (matchPattern(reservation.resultSize, m_ConstantInt(&opSizeInt))) {
-      opSize = opSizeInt.getZExtValue();
-    }
-    if (buckets.empty() || buckets.back().totalSize + opSize > maxSize) {
-      buckets.push_back(ResultReservationsBucket());
-    }
-    buckets.back().reservations.push_back(reservation);
-    buckets.back().totalSize += opSize;
-  }
-};
+// A map of allocation placement affinities to the alloc reservations requested.
+using ResultReservationsBucketList = SizeLimitedBucketList<ResultReservation>;
 using ResultAllocationMap =
     llvm::MapVector<IREE::Stream::AffinityAttr, ResultReservationsBucketList>;
 
@@ -1562,7 +1562,7 @@ reserveResultAllocations(ResultAllocationMap &reservationMap) {
     for (auto &bucket : reservations.buckets) {
       // Sub-bucket by lifetime within each size-limited bucket.
       llvm::DenseMap<unsigned, size_t> lifetimeToSetIndex;
-      for (auto &reservation : bucket.reservations) {
+      for (auto &reservation : bucket.objs) {
         unsigned lifetime =
             static_cast<unsigned>(reservation.resultType.getLifetime());
         auto it = lifetimeToSetIndex.find(lifetime);
@@ -1931,8 +1931,8 @@ allocateExecutionRegion(IREE::Stream::AsyncExecuteOp executeOp,
       resultReservation.result.printAsOperand(llvm::dbgs(), asmState);
       llvm::dbgs() << "\n";
     });
-    resultReservations[allocationAffinity].addReservation(resultReservation,
-                                                          maxAllocationSize);
+    resultReservations[allocationAffinity].add(resultReservation,
+                                               maxAllocationSize);
   }
   for (auto &resultAllocation : reserveResultAllocations(resultReservations)) {
     for (auto &reservationSet : resultAllocation.reservationSets) {
