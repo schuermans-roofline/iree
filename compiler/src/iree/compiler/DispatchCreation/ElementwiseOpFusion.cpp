@@ -228,6 +228,17 @@ void ElementwiseOpFusionPass::runOnOperation() {
         if (operands.size() >= kIreeMaxOperandCount) {
           return false;
         }
+        // Likewise for the bytes a dispatch binds. Fusion within a dispatch
+        // does not change what the dispatch binds.
+        if (!intraDispatch && maxBindingBytes > 0) {
+          int64_t baselineBytes =
+              std::max(IREE::Flow::getDispatchBindingBytes(producer),
+                       IREE::Flow::getDispatchBindingBytes(consumer));
+          if (IREE::Flow::wouldExceedDispatchBindingBytes(
+                  {producer, consumer}, maxBindingBytes, baselineBytes)) {
+            return false;
+          }
+        }
 
         ElementwiseOpsFusabilityOptions options;
         options.fuseMultiReduction = fuseMultiReduction;

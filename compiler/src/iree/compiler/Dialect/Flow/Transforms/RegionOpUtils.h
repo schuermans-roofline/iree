@@ -131,6 +131,9 @@ FailureOr<Flow::DispatchRegionOp> wrapOpInDispatchRegion(RewriterBase &rewriter,
 /// into a dispatch region.
 struct CloneableIntoDispatchOptions {
   bool aggressive = false;
+  // If positive, producers are not cloned into a dispatch region if that would
+  // make it bind more than this many bytes (see getDispatchBindingBytes).
+  int64_t maxBindingBytes = 0;
 };
 bool isCloneableIntoDispatchOp(Operation *op,
                                CloneableIntoDispatchOptions options = {});
@@ -146,6 +149,30 @@ bool isCloneableIntoDispatchOp(Operation *op,
 /// will be added to the yielded values of the dispatch region op.
 FailureOr<Operation *> hoistOutOfDispatch(RewriterBase &rewriter,
                                           Operation *op);
+
+/// Returns the bytes of the statically shaped tensors that a dispatch formed
+/// from `ops`, with `clonedOps` cloned into it, binds. Accounts for:
+///  - The tensors that these ops use, either as operands or in their regions,
+///    and that are defined outside of these ops.
+///  - The results of `ops` that are used outside of these ops.
+/// Cloned ops remain for their other users, so their results are never written
+/// by the dispatch and not included in the estimate.
+/// Tensors that do not become bindings (`tensor.empty`, `linalg.fill` and
+/// splat constants) are not counted.
+/// Loads of the same global are counted once.
+/// Dynamically shaped tensors count as zero bytes.
+int64_t getDispatchBindingBytes(ArrayRef<Operation *> ops,
+                                ArrayRef<Operation *> clonedOps = {});
+
+/// Returns true if `maxBindingBytes` is positive and a dispatch formed from
+/// `ops` and `clonedOps` (see getDispatchBindingBytes) would bind more than
+/// `maxBindingBytes` and more than `baselineBytes`. Fusion sites pass what the
+/// dispatch would bind without the fusion as the baseline, so a fusion that
+/// does not grow a dispatch already over the limit is still allowed.
+bool wouldExceedDispatchBindingBytes(ArrayRef<Operation *> ops,
+                                     int64_t maxBindingBytes,
+                                     int64_t baselineBytes = 0,
+                                     ArrayRef<Operation *> clonedOps = {});
 
 /// Collect all ops that should be cloned into the given dispatch region op.
 SmallVector<Operation *>

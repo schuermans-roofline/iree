@@ -222,6 +222,22 @@ static FailureOr<unsigned> fuseMultiUseProducers(
             continue;
           }
 
+          // 10. Do not let the fused ops bind more bytes than allowed.
+          if (!options.intraDispatch && options.maxBindingBytes > 0) {
+            SmallVector<Operation *> dispatchOps = {genericOp};
+            if (auto it = fusedOps.find(genericOp); it != fusedOps.end()) {
+              llvm::append_range(dispatchOps, it->second);
+            }
+            int64_t baselineBytes = std::max(
+                IREE::Flow::getDispatchBindingBytes(dispatchOps),
+                IREE::Flow::getDispatchBindingBytes(producer.getOperation()));
+            dispatchOps.push_back(producer);
+            if (IREE::Flow::wouldExceedDispatchBindingBytes(
+                    dispatchOps, options.maxBindingBytes, baselineBytes)) {
+              continue;
+            }
+          }
+
           fusableProducer = producer;
           break;
         }
@@ -272,8 +288,8 @@ struct FuseMultiUseElementwiseProducerPass final
 void FuseMultiUseElementwiseProducerPass::runOnOperation() {
   Operation *funcOp = getOperation();
   MLIRContext *context = funcOp->getContext();
-  FuseMultiUseElementwiseProducerPassOptions options{intraDispatch,
-                                                     numIterations};
+  FuseMultiUseElementwiseProducerPassOptions options{
+      intraDispatch, numIterations, maxBindingBytes};
 
   // Run fusion of producer with consumer when producer has multiple uses.
   // For now run this sequence a fixed times (2 by default). Ideally we

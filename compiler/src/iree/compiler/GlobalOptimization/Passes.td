@@ -373,6 +373,11 @@ def SplitLargeConstantsPass :
         element unless the index lies in its shard.
 
     A constant with any other use is left unchanged with a warning.
+
+    Each shard is its own binding within the allocation limit, even when
+    dispatch region formation fuses the per-shard ops back together. Targets
+    that also limit the bytes one dispatch may bind can keep them apart with
+    `--iree-dispatch-creation-max-dispatch-binding-bytes`.
   }];
   let dependentDialects = [
     "mlir::arith::ArithDialect",

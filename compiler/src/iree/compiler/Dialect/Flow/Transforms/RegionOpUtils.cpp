@@ -14,6 +14,7 @@
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
 #include "iree/compiler/Dialect/TensorExt/IR/TensorExtOps.h"
+#include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
 #include "iree/compiler/Utils/RegionOpUtils.h"
 #include "llvm/ADT/STLExtras.h"
@@ -34,6 +35,7 @@
 #include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/RegionUtils.h"
@@ -1035,6 +1037,107 @@ hasUnfusableUseInDispatch(Value v, Operation *dispatchOp,
   return false;
 }
 
+static int64_t getStaticTensorBytes(Type type) {
+  auto tensorType = dyn_cast<RankedTensorType>(type);
+  if (!tensorType || !tensorType.hasStaticShape()) {
+    return 0;
+  }
+  return IREE::Util::getRoundedPhysicalStorageSize(tensorType);
+}
+
+/// Returns true if `op` is in `opSet` or nested in an op of `opSet`.
+static bool isOpInside(Operation *op,
+                       const llvm::SmallPtrSetImpl<Operation *> &opSet) {
+  for (; op; op = op->getParentOp()) {
+    if (opSet.contains(op)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+namespace {
+
+/// Sums the bytes of the inputs a dispatch made of `opSet` binds, counting
+/// each bound storage once.
+class EstimateDispatchSize {
+public:
+  explicit EstimateDispatchSize(const llvm::SmallPtrSetImpl<Operation *> &opSet)
+      : opSet(opSet) {}
+
+  /// Adds `value` as an input of the dispatch. Values defined inside the
+  /// dispatch, or that the dispatch materializes itself, bind nothing.
+  void add(Value value) {
+    Operation *definingOp = value.getDefiningOp();
+    if (definingOp && isOpInside(definingOp, opSet)) {
+      return;
+    }
+    SplatElementsAttr splatAttr;
+    if (isa_and_nonnull<tensor::EmptyOp, linalg::FillOp>(definingOp) ||
+        matchPattern(value, m_Constant(&splatAttr))) {
+      return;
+    }
+    const void *key = value.getAsOpaquePointer();
+    if (auto loadOp = dyn_cast_if_present<IREE::Util::GlobalLoadOpInterface>(
+            definingOp)) {
+      key = loadOp.getGlobalAttr().getAsOpaquePointer();
+    }
+    if (includedValues.insert(key).second) {
+      bytes += getStaticTensorBytes(value.getType());
+    }
+  }
+
+  int64_t getBytes() const { return bytes; }
+
+private:
+  const llvm::SmallPtrSetImpl<Operation *> &opSet;
+  // Loads of the same global bind the same storage, so they are keyed by the
+  // global instead of the loaded value.
+  llvm::DenseSet<const void *> includedValues;
+  int64_t bytes = 0;
+};
+
+} // namespace
+
+int64_t getDispatchBindingBytes(ArrayRef<Operation *> ops,
+                                ArrayRef<Operation *> clonedOps) {
+  llvm::SmallPtrSet<Operation *, 8> opSet(ops.begin(), ops.end());
+  opSet.insert(clonedOps.begin(), clonedOps.end());
+
+  EstimateDispatchSize estimate(opSet);
+  for (Operation *op : llvm::concat<Operation *const>(ops, clonedOps)) {
+    for (Value operand : op->getOperands()) {
+      estimate.add(operand);
+    }
+    mlir::visitUsedValuesDefinedAbove(
+        op->getRegions(), [&](OpOperand *use) { estimate.add(use->get()); });
+  }
+  int64_t bytes = estimate.getBytes();
+  // Cloned ops stay in place for their other users, so only the results of
+  // `ops` are written by the dispatch.
+  for (Operation *op : ops) {
+    for (OpResult result : op->getResults()) {
+      if (llvm::any_of(result.getUsers(), [&](Operation *user) {
+            return !isOpInside(user, opSet);
+          })) {
+        bytes += getStaticTensorBytes(result.getType());
+      }
+    }
+  }
+  return bytes;
+}
+
+bool wouldExceedDispatchBindingBytes(ArrayRef<Operation *> ops,
+                                     int64_t maxBindingBytes,
+                                     int64_t baselineBytes,
+                                     ArrayRef<Operation *> clonedOps) {
+  if (maxBindingBytes <= 0) {
+    return false;
+  }
+  int64_t bytes = getDispatchBindingBytes(ops, clonedOps);
+  return bytes > maxBindingBytes && bytes > baselineBytes;
+}
+
 SmallVector<Operation *> getCloneableOps(IREE::Flow::DispatchRegionOp regionOp,
                                          CloneableIntoDispatchOptions options) {
   // Find values that are used inside of the dispatch region but defined outside
@@ -1063,10 +1166,23 @@ SmallVector<Operation *> getCloneableOps(IREE::Flow::DispatchRegionOp regionOp,
     visited.insert(outsideValue);
 
     Operation *definingOp = outsideValue.getDefiningOp();
+    auto exceedsBindingBytes = [&]() {
+      if (options.maxBindingBytes <= 0) {
+        return false;
+      }
+      SmallVector<Operation *> clonedOps(result);
+      int64_t baselineBytes =
+          getDispatchBindingBytes(regionOp.getOperation(), clonedOps);
+      clonedOps.push_back(definingOp);
+      return wouldExceedDispatchBindingBytes(regionOp.getOperation(),
+                                             options.maxBindingBytes,
+                                             baselineBytes, clonedOps);
+    };
     if (!definingOp ||
         !IREE::Flow::isCloneableIntoDispatchOp(definingOp, options) ||
         hasUnfusableUseInDispatch(outsideValue, regionOp,
-                                  unfusableInitSources)) {
+                                  unfusableInitSources) ||
+        exceedsBindingBytes()) {
       valuesDefinedAbove.insert(outsideValue);
       continue;
     }
