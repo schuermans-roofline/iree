@@ -46,6 +46,15 @@ static llvm::cl::opt<bool> clEnableFuseHorizontalContractions(
         "Enables horizontal fusion of contractions with one common operand"),
     llvm::cl::init(false));
 
+static llvm::cl::opt<int64_t> clMaxDispatchBindingBytes(
+    "iree-dispatch-creation-max-dispatch-binding-bytes",
+    llvm::cl::desc(
+        "If positive, operations are not fused into a dispatch if that would "
+        "make it bind more than this many bytes of statically shaped tensors. "
+        "For targets that must keep all bindings of a dispatch mapped at "
+        "once in a limited address space."),
+    llvm::cl::init(0));
+
 static llvm::cl::opt<bool> clExperimentalMultiUseEncodingFusion(
     "iree-dispatch-creation-experimental-multi-use-encoding-fusion",
     llvm::cl::desc(
@@ -175,7 +184,8 @@ static void addDispatchRegionCreationPreprocessingPasses(
                 /*intraDispatch=*/false,
                 /*fuseMultiReduction=*/clEnableElementWiseFuseMultiReduction,
                 /*fuseTruncateOps=*/clEnableEarlyTruncFusion,
-                /*fuseBroadcastOps=*/false});
+                /*fuseBroadcastOps=*/false,
+                /*maxBindingBytes=*/clMaxDispatchBindingBytes});
       })
       .addPass(IREE::Flow::createCanonicalizePass)
       .addPass(mlir::createCSEPass)
@@ -201,7 +211,8 @@ static void addDispatchRegionCreationPreprocessingPasses(
                 /*intraDispatch=*/false,
                 /*fuseMultiReduction=*/clEnableElementWiseFuseMultiReduction,
                 /*fuseTruncateOps=*/clEnableEarlyTruncFusion,
-                /*fuseBroadcastOps=*/false});
+                /*fuseBroadcastOps=*/false,
+                /*maxBindingBytes=*/clMaxDispatchBindingBytes});
       })
       .addPass(IREE::Flow::createCanonicalizePass)
       .addPass(mlir::createCSEPass)
@@ -224,7 +235,12 @@ static void addDispatchRegionCreationPreprocessingPasses(
       //    even if the producer has multiple uses.
       .addPredicatedPass(
           dispatchOptions.enableFuseMultiUse,
-          DispatchCreation::createFuseMultiUseElementwiseProducerPass)
+          []() {
+            FuseMultiUseElementwiseProducerPassOptions options;
+            options.maxBindingBytes = clMaxDispatchBindingBytes;
+            return DispatchCreation::createFuseMultiUseElementwiseProducerPass(
+                options);
+          })
 
       // 6. Some more "post elementwise fusion passes".
       .addPass(IREE::Flow::createCanonicalizePass)
@@ -285,11 +301,12 @@ static void addDispatchRegionCreationPasses(OpPassManager &passManager,
       // Create `flow.dispatch.region` centered around a root and fuse with
       // producers and consumers.
       .addPass([&] {
-        return DispatchCreation::createFormDispatchRegionsPass(
-            FormDispatchRegionsPassOptions{
-                options.enableAggressiveFusion, options.enableFuseMultiUse,
-                options.enableFusePaddingIntoLinalgConsumerOps,
-                clEnableFusePaddingIntoLinalgProducerOps});
+        FormDispatchRegionsPassOptions formOptions{
+            options.enableAggressiveFusion, options.enableFuseMultiUse,
+            options.enableFusePaddingIntoLinalgConsumerOps,
+            clEnableFusePaddingIntoLinalgProducerOps};
+        formOptions.maxBindingBytes = clMaxDispatchBindingBytes;
+        return DispatchCreation::createFormDispatchRegionsPass(formOptions);
       })
       // Elementwise fuse operations that are iside a dispatch if possible.
       .addPass([&]() {
@@ -317,7 +334,8 @@ static void addDispatchRegionCreationPasses(OpPassManager &passManager,
       .addPass([&] {
         return DispatchCreation::createCloneProducersIntoDispatchRegionsPass(
             CloneProducersIntoDispatchRegionsPassOptions{
-                options.enableAggressiveFusion});
+                options.enableAggressiveFusion,
+                /*maxBindingBytes=*/clMaxDispatchBindingBytes});
       })
       // Collapse dimensions of linalg Ops.
       .addPass(DispatchCreation::createCollapseDimensionsPass)
