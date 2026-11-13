@@ -113,6 +113,9 @@ def ElementwiseOpFusionPass :
            "Fuse producer truncate-like operations with consumers">,
     Option<"fuseBroadcastOps", "fuse-broadcast-ops", "bool",
            /*default=*/"false", "Fuse broadcast-like ops with producers">,
+    Option<"maxBindingBytes", "max-binding-bytes", "int64_t",
+           /*default=*/"0",
+           "If positive, do not fuse operations into a dispatch that would then bind more than this many bytes of statically shaped tensors">,
   ];
   let dependentDialects = [
     "mlir::affine::AffineDialect",
@@ -212,7 +215,10 @@ def FuseMultiUseElementwiseProducerPass :
     Option<"intraDispatch", "intra-dispatch", "bool",
            /*default=*/"false", "Fuse operations within a dispatch only (default is to fuse only operations outside of a dispatch)">,
     Option<"numIterations", "num-iterations", "unsigned",
-           /*default=*/"2", "Number of iterations to fuse multiuse ops">
+           /*default=*/"2", "Number of iterations to fuse multiuse ops">,
+    Option<"maxBindingBytes", "max-binding-bytes", "int64_t",
+           /*default=*/"0",
+           "If positive, do not fuse operations into a dispatch that would then bind more than this many bytes of statically shaped tensors">
   ];
   let dependentDialects = [
     "mlir::affine::AffineDialect",
@@ -303,6 +309,9 @@ def CloneProducersIntoDispatchRegionsPass :
     Option<"aggressive", "aggressive", "bool",
     /*default=*/"false",
     "Include operations that are cloned only under aggressive fusion mode">,
+    Option<"maxBindingBytes", "max-binding-bytes", "int64_t",
+           /*default=*/"0",
+           "If positive, do not clone producers into a dispatch that would then bind more than this many bytes of statically shaped tensors">,
   ];
 }
 
@@ -339,7 +348,10 @@ def FormDispatchRegionsPass :
     Option<"fuseMmt4d", "fuse-mmt4d", "bool",
            /*default=*/"false", "Fuse layout-preserving elementwise consumers and the result unpack into mmt4d and batch_mmt4d dispatches. Modules with the iree.encoding.materialized_layout_target attribute always enable it, even if it is set to false">,
     Option<"fuseDataTiledConvolution", "fuse-data-tiled-convolution", "bool",
-           /*default=*/"false", "Fuse the result unpack, after layout-preserving elementwise consumers, into data-tiled convolution dispatches. Modules with the iree.encoding.materialized_layout_target attribute always enable it, even if it is set to false">
+           /*default=*/"false", "Fuse the result unpack, after layout-preserving elementwise consumers, into data-tiled convolution dispatches. Modules with the iree.encoding.materialized_layout_target attribute always enable it, even if it is set to false">,
+    Option<"maxBindingBytes", "max-binding-bytes", "int64_t",
+           /*default=*/"0",
+           "If positive, do not fuse operations into a dispatch that would then bind more than this many bytes of statically shaped tensors">
   ];
   let description = [{
     Pass to form dispatch.region ops from Linalg on tensor ops. A dispatch region
